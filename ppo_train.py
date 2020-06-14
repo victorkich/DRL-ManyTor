@@ -1,197 +1,226 @@
-#!/usr/bin/env python3
-import os
-import math
-import ptan
-import time
-import gym
-import roboschool
-import argparse
-from tensorboardX import SummaryWriter
-
-from lib import model
-
-import numpy as np
 import torch
-import torch.optim as optim
-import torch.nn.functional as F
+import torch.nn as nn
+from torch.distributions import MultivariateNormal
+import numpy as np
+from ManyTor import manytor as tor
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+OBJ_NUMBER = 30
 
 
-ENV_ID = "RoboschoolHalfCheetah-v1"
-GAMMA = 0.99
-GAE_LAMBDA = 0.95
+class Memory:
+    def __init__(self):
+        self.actions = []
+        self.states = []
+        self.logprobs = []
+        self.rewards = []
+        self.is_terminals = []
+    
+    def clear_memory(self):
+        del self.actions[:]
+        del self.states[:]
+        del self.logprobs[:]
+        del self.rewards[:]
+        del self.is_terminals[:]
 
-TRAJECTORY_SIZE = 2049
-LEARNING_RATE_ACTOR = 1e-4
-LEARNING_RATE_CRITIC = 1e-3
 
-PPO_EPS = 0.2
-PPO_EPOCHES = 10
-PPO_BATCH_SIZE = 64
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim, action_dim, action_std):
+        super(ActorCritic, self).__init__()
+        # action mean range -1 to 1
+        self.actor =  nn.Sequential(
+                nn.Linear(state_dim, 128),
+                nn.Tanh(),
+                nn.Linear(128, 64),
+                nn.Tanh(),
+                nn.Linear(64, 32),
+                nn.Tanh(),
+                nn.Linear(32, action_dim),
+                nn.Tanh()
+                )
+        # critic
+        self.critic = nn.Sequential(
+                nn.Linear(state_dim, 128),
+                nn.Tanh(),
+                nn.Linear(128, 64),
+                nn.Tanh(),
+                nn.Linear(64, 32),
+                nn.Tanh(),
+                nn.Linear(32, 1)
+                )
+        self.action_var = torch.full((action_dim,), action_std*action_std).to(device)
+        
+    def forward(self):
+        raise NotImplementedError
+    
+    def act(self, state, memory):
+        action_mean = self.actor(state)
+        cov_mat = torch.diag(self.action_var).to(device)
+        
+        dist = MultivariateNormal(action_mean, cov_mat)
+        action = dist.sample()
+        action_logprob = dist.log_prob(action)
+        
+        memory.states.append(state)
+        memory.actions.append(action)
+        memory.logprobs.append(action_logprob)
+        
+        return action.detach()
+    
+    def evaluate(self, state, action):   
+        action_mean = self.actor(state)
+        
+        action_var = self.action_var.expand_as(action_mean)
+        cov_mat = torch.diag_embed(action_var).to(device)
+        
+        dist = MultivariateNormal(action_mean, cov_mat)
+        
+        action_logprobs = dist.log_prob(action)
+        dist_entropy = dist.entropy()
+        state_value = self.critic(state)
+        
+        return action_logprobs, torch.squeeze(state_value), dist_entropy
 
-TEST_ITERS = 100000
+class PPO:
+    def __init__(self, state_dim, action_dim, action_std, lr, betas, gamma, K_epochs, eps_clip):
+        self.lr = lr
+        self.betas = betas
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.K_epochs = K_epochs
+        
+        self.policy = ActorCritic(state_dim, action_dim, action_std).to(device)
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr, betas=betas)
+        
+        self.policy_old = ActorCritic(state_dim, action_dim, action_std).to(device)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        
+        self.MseLoss = nn.MSELoss()
+    
+    def select_action(self, state, memory):
+        state = torch.FloatTensor(state.reshape(1, -1)).to(device)
+        return self.policy_old.act(state, memory).cpu().data.numpy().flatten()
+    
+    def update(self, memory):
+        # Monte Carlo estimate of rewards:
+        rewards = []
+        discounted_reward = 0
+        for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
+            if is_terminal:
+                discounted_reward = 0
+            discounted_reward = reward + (self.gamma * discounted_reward)
+            rewards.insert(0, discounted_reward)
+        
+        # Normalizing the rewards:
+        rewards = torch.tensor(rewards).to(device)
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-5)
+        
+        # convert list to tensor
+        old_states = torch.squeeze(torch.stack(memory.states).to(device), 1).detach()
+        old_actions = torch.squeeze(torch.stack(memory.actions).to(device), 1).detach()
+        old_logprobs = torch.squeeze(torch.stack(memory.logprobs), 1).to(device).detach()
+        
+        # Optimize policy for K epochs:
+        for _ in range(self.K_epochs):
+            # Evaluating old actions and values :
+            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
+            
+            # Finding the ratio (pi_theta / pi_theta__old):
+            ratios = torch.exp(logprobs - old_logprobs.detach())
+
+            # Finding Surrogate Loss:
+            advantages = rewards - state_values.detach()   
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+            loss = -torch.min(surr1, surr2) + 0.5*self.MseLoss(state_values, rewards) - 0.01*dist_entropy
+            
+            # take gradient step
+            self.optimizer.zero_grad()
+            loss.mean().backward()
+            self.optimizer.step()
+            
+        # Copy new weights into old policy:
+        self.policy_old.load_state_dict(self.policy.state_dict())
 
 
-def test_net(net, env, count=10, device="cpu"):
-    rewards = 0.0
-    steps = 0
-    for _ in range(count):
-        obs = env.reset()
-        while True:
-            obs_v = ptan.agent.float32_preprocessor([obs]).to(device)
-            mu_v = net(obs_v)[0]
-            action = mu_v.squeeze(dim=0).data.cpu().numpy()
-            action = np.clip(action, -1, 1)
-            obs, reward, done, _ = env.step(action)
-            rewards += reward
-            steps += 1
+def main():
+    ############## Hyperparameters ##############
+    render = False
+    solved_reward = 100          # stop training if avg_reward > solved_reward
+    log_interval = 5           # print avg reward in the interval
+    max_episodes = 10000        # max training episodes
+    max_timesteps = 1000        # max timesteps in one episode
+    
+    update_timestep = 2500      # update policy every n timesteps
+    action_std = 0.5            # constant std for action distribution (Multivariate Normal)
+    K_epochs = 20               # update policy for K epochs
+    eps_clip = 0.2              # clip parameter for PPO
+    gamma = 0.99                # discount factor
+    
+    lr = 0.0005                 # parameters for Adam optimizer
+    betas = (0.9, 0.999)
+    
+    #############################################
+    
+    # creating environment
+    env = tor.Environment(OBJ_NUMBER)
+    state_dim = OBJ_NUMBER*3
+    action_dim = 4
+    
+    memory = Memory()
+    ppo = PPO(state_dim, action_dim, action_std, lr, betas, gamma, K_epochs, eps_clip)
+    
+    # logging variables
+    running_reward = 0
+    avg_length = 0
+    time_step = 0
+    
+    # training loop
+    for i_episode in range(1, max_episodes+1):
+        state = env.reset(returnable=True)
+        for t in range(max_timesteps):
+            time_step +=1
+            # Running policy_old:
+            action = ppo.select_action(state, memory)*180.0
+            state, reward, done = env.step(action)
+            
+            # Saving reward and is_terminals:
+            memory.rewards.append(reward)
+            memory.is_terminals.append(done)
+            
+            # update if its time
+            if time_step % update_timestep == 0:
+                ppo.update(memory)
+                memory.clear_memory()
+                time_step = 0
+            running_reward += reward
+            if render:
+                env.render()
             if done:
                 break
-    return rewards / count, steps / count
+        
+        avg_length += t+1
+        
+        # stop training if avg_reward > solved_reward
+        if running_reward > (log_interval*solved_reward):
+            print("########## Solved! ##########")
+            torch.save(ppo.policy.state_dict(), './PPO_continuous_solved_manytor.pth')
+            break
+        
+        # save every 500 episodes
+        if i_episode % 500 == 0:
+            torch.save(ppo.policy.state_dict(), './PPO_continuous_manytor.pth')
+            
+        # logging
+        if i_episode % log_interval == 0:
+            avg_length = int(avg_length/log_interval)
+            running_reward = int((running_reward/log_interval))
+            
+            print('Episode {} \t Avg length: {} \t Avg reward: {}'.format(i_episode, avg_length, running_reward))
+            running_reward = 0
+            avg_length = 0
 
 
-def calc_logprob(mu_v, logstd_v, actions_v):
-    p1 = - ((mu_v - actions_v) ** 2) / (2*torch.exp(logstd_v).clamp(min=1e-3))
-    p2 = - torch.log(torch.sqrt(2 * math.pi * torch.exp(logstd_v)))
-    return p1 + p2
-
-
-def calc_adv_ref(trajectory, net_crt, states_v, device="cpu"):
-    """
-    By trajectory calculate advantage and 1-step ref value
-    :param trajectory: trajectory list
-    :param net_crt: critic network
-    :param states_v: states tensor
-    :return: tuple with advantage numpy array and reference values
-    """
-    values_v = net_crt(states_v)
-    values = values_v.squeeze().data.cpu().numpy()
-    # generalized advantage estimator: smoothed version of the advantage
-    last_gae = 0.0
-    result_adv = []
-    result_ref = []
-    for val, next_val, (exp,) in zip(reversed(values[:-1]), reversed(values[1:]),
-                                     reversed(trajectory[:-1])):
-        if exp.done:
-            delta = exp.reward - val
-            last_gae = delta
-        else:
-            delta = exp.reward + GAMMA * next_val - val
-            last_gae = delta + GAMMA * GAE_LAMBDA * last_gae
-        result_adv.append(last_gae)
-        result_ref.append(last_gae + val)
-
-    adv_v = torch.FloatTensor(list(reversed(result_adv))).to(device)
-    ref_v = torch.FloatTensor(list(reversed(result_ref))).to(device)
-    return adv_v, ref_v
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cuda", default=False, action='store_true', help='Enable CUDA')
-    parser.add_argument("-n", "--name", required=True, help="Name of the run")
-    parser.add_argument("-e", "--env", default=ENV_ID, help="Environment id, default=" + ENV_ID)
-    args = parser.parse_args()
-    device = torch.device("cuda" if args.cuda else "cpu")
-
-    save_path = os.path.join("saves", "ppo-" + args.name)
-    os.makedirs(save_path, exist_ok=True)
-
-    env = gym.make(args.env)
-    test_env = gym.make(args.env)
-
-    net_act = model.ModelActor(env.observation_space.shape[0], env.action_space.shape[0]).to(device)
-    net_crt = model.ModelCritic(env.observation_space.shape[0]).to(device)
-    print(net_act)
-    print(net_crt)
-
-    writer = SummaryWriter(comment="-ppo_" + args.name)
-    agent = model.AgentA2C(net_act, device=device)
-    exp_source = ptan.experience.ExperienceSource(env, agent, steps_count=1)
-
-    opt_act = optim.Adam(net_act.parameters(), lr=LEARNING_RATE_ACTOR)
-    opt_crt = optim.Adam(net_crt.parameters(), lr=LEARNING_RATE_CRITIC)
-
-    trajectory = []
-    best_reward = None
-    with ptan.common.utils.RewardTracker(writer) as tracker:
-        for step_idx, exp in enumerate(exp_source):
-            rewards_steps = exp_source.pop_rewards_steps()
-            if rewards_steps:
-                rewards, steps = zip(*rewards_steps)
-                writer.add_scalar("episode_steps", np.mean(steps), step_idx)
-                tracker.reward(np.mean(rewards), step_idx)
-
-            if step_idx % TEST_ITERS == 0:
-                ts = time.time()
-                rewards, steps = test_net(net_act, test_env, device=device)
-                print("Test done in %.2f sec, reward %.3f, steps %d" % (
-                    time.time() - ts, rewards, steps))
-                writer.add_scalar("test_reward", rewards, step_idx)
-                writer.add_scalar("test_steps", steps, step_idx)
-                if best_reward is None or best_reward < rewards:
-                    if best_reward is not None:
-                        print("Best reward updated: %.3f -> %.3f" % (best_reward, rewards))
-                        name = "best_%+.3f_%d.dat" % (rewards, step_idx)
-                        fname = os.path.join(save_path, name)
-                        torch.save(net_act.state_dict(), fname)
-                    best_reward = rewards
-
-            trajectory.append(exp)
-            if len(trajectory) < TRAJECTORY_SIZE:
-                continue
-
-            traj_states = [t[0].state for t in trajectory]
-            traj_actions = [t[0].action for t in trajectory]
-            traj_states_v = torch.FloatTensor(traj_states).to(device)
-            traj_actions_v = torch.FloatTensor(traj_actions).to(device)
-            traj_adv_v, traj_ref_v = calc_adv_ref(trajectory, net_crt, traj_states_v, device=device)
-            mu_v = net_act(traj_states_v)
-            old_logprob_v = calc_logprob(mu_v, net_act.logstd, traj_actions_v)
-
-            # normalize advantages
-            traj_adv_v = (traj_adv_v - torch.mean(traj_adv_v)) / torch.std(traj_adv_v)
-
-            # drop last entry from the trajectory, an our adv and ref value calculated without it
-            trajectory = trajectory[:-1]
-            old_logprob_v = old_logprob_v[:-1].detach()
-
-            sum_loss_value = 0.0
-            sum_loss_policy = 0.0
-            count_steps = 0
-
-            for epoch in range(PPO_EPOCHES):
-                for batch_ofs in range(0, len(trajectory), PPO_BATCH_SIZE):
-                    states_v = traj_states_v[batch_ofs:batch_ofs + PPO_BATCH_SIZE]
-                    actions_v = traj_actions_v[batch_ofs:batch_ofs + PPO_BATCH_SIZE]
-                    batch_adv_v = traj_adv_v[batch_ofs:batch_ofs + PPO_BATCH_SIZE].unsqueeze(-1)
-                    batch_ref_v = traj_ref_v[batch_ofs:batch_ofs + PPO_BATCH_SIZE]
-                    batch_old_logprob_v = old_logprob_v[batch_ofs:batch_ofs + PPO_BATCH_SIZE]
-
-                    # critic training
-                    opt_crt.zero_grad()
-                    value_v = net_crt(states_v)
-                    loss_value_v = F.mse_loss(value_v.squeeze(-1), batch_ref_v)
-                    loss_value_v.backward()
-                    opt_crt.step()
-
-                    # actor training
-                    opt_act.zero_grad()
-                    mu_v = net_act(states_v)
-                    logprob_pi_v = calc_logprob(mu_v, net_act.logstd, actions_v)
-                    ratio_v = torch.exp(logprob_pi_v - batch_old_logprob_v)
-                    surr_obj_v = batch_adv_v * ratio_v
-                    clipped_surr_v = batch_adv_v * torch.clamp(ratio_v, 1.0 - PPO_EPS, 1.0 + PPO_EPS)
-                    loss_policy_v = -torch.min(surr_obj_v, clipped_surr_v).mean()
-                    loss_policy_v.backward()
-                    opt_act.step()
-
-                    sum_loss_value += loss_value_v.item()
-                    sum_loss_policy += loss_policy_v.item()
-                    count_steps += 1
-
-            trajectory.clear()
-            writer.add_scalar("advantage", traj_adv_v.mean().item(), step_idx)
-            writer.add_scalar("values", traj_ref_v.mean().item(), step_idx)
-            writer.add_scalar("loss_policy", sum_loss_policy / count_steps, step_idx)
-            writer.add_scalar("loss_value", sum_loss_value / count_steps, step_idx)
-
+if __name__ == '__main__':
+    main()
+    
